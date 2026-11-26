@@ -76,11 +76,8 @@ class ExtraConfigDefault(enum.Enum):
     # Interval (seconds) between periodic heartbeat pings
     # to the server.
     heartbeat_interval = 10.0
-    # Max age (seconds) of a pending retrieve (KV load) before it is
-    # treated as failed: the request is reported finished with its blocks
-    # marked for recompute, instead of hanging in WAITING_FOR_REMOTE_KVS
-    # forever when a transfer result is lost. Healthy transfers complete
-    # in milliseconds; 0 disables the timeout.
+    # Age in seconds before a pending retrieve is reported as unavailable.
+    # Its destination blocks remain owned until transfer completion. Zero disables.
     retrieve_timeout = 30.0
     # Routing mode for ``create_transfer_context``: ``auto`` keeps the
     # historical CUDA -> lmcache_driven / others -> engine_driven dispatch;
@@ -668,6 +665,7 @@ class LMCacheMPSchedulerAdapter:
         #   even after the server has already popped the job (exactly-once).
         # - _per_server_hits: {request_id: {server_url: hit_chunks}}.
         #   Per-server hit counts, used to detect disagreement and free tail locks.
+        self._lookup_disabled_workers: set[int] = set()
         self._pending_lookups: set[str] = set()
         self._unacked_lookups: dict[str, _LookupAck] = {}
         self._finished_lookup_results: dict[str, int] = {}
@@ -761,6 +759,14 @@ class LMCacheMPSchedulerAdapter:
                 hb.start()
                 self._heartbeats[url] = hb
 
+    def update_worker_availability(self, updates: dict[int, bool]) -> None:
+        """Allow new external lookups only once all stalled workers recover."""
+        for rank, available in updates.items():
+            if available:
+                self._lookup_disabled_workers.discard(rank)
+            else:
+                self._lookup_disabled_workers.add(rank)
+
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
         self,
@@ -797,7 +803,7 @@ class LMCacheMPSchedulerAdapter:
         """
         self._ensure_heartbeat_started()
 
-        if not self.is_healthy:
+        if not self.is_healthy or self._lookup_disabled_workers:
             return
 
         if request_id in self._pending_lookups:
@@ -1255,7 +1261,11 @@ class LMCacheMPWorkerAdapter:
         self.store_events: dict[str, _IpcEvent] = {}
         self.retrieve_events: dict[str, _IpcEvent] = {}
 
-        # Block IDs that failed due to retrieve timeout
+        self._overdue_retrieves: set[str] = set()
+        self._newly_unavailable: set[str] = set()
+        self._advertised_available = True
+
+        # Block IDs for terminal failures or retrieves rejected before submission.
         self.error_block_ids: set[int] = set()
 
         # Retrieve request ids dropped by the unhealthy early-return of
@@ -1503,6 +1513,9 @@ class LMCacheMPWorkerAdapter:
             succeeds; ``False`` on failure or a requested heartbeat stop
             (event stays cleared; retried on the next successful PING).
         """
+        if self.retrieve_futures:
+            # A successful ping does not fence writes through the previous context.
+            return False
         if not self.kv_caches:
             # Nothing was registered yet (server flapped before the
             # very first register_kv_caches). Treat as success so the
@@ -1783,6 +1796,7 @@ class LMCacheMPWorkerAdapter:
         self,
         finished_req_ids_from_lmcache: set[str],
         finished_req_ids_from_engine: set[str],
+        finished_retrieves: set[str],
     ) -> set[str]:
         """Merge LMCache-side and engine-side finished store info."""
         self.finished_stores.update(finished_req_ids_from_lmcache)
@@ -1792,46 +1806,66 @@ class LMCacheMPWorkerAdapter:
                 continue
             if req_id in self.finished_stores or req_id in self.store_futures:
                 self.previously_finished.add(req_id)
+            elif req_id in self.retrieve_futures or req_id in finished_retrieves:
+                # A receive-only request is released by its receive completion.
+                self._returned_finished.add(req_id)
             else:
                 ret_stores.add(req_id)
         ret_stores.update(self._update_and_get_finished_store())
         self._returned_finished.update(ret_stores)
         return ret_stores
 
-    def _expire_timed_out_retrieves(self, finished_retrieves: set[str]) -> None:
-        """Force-fail retrieve futures pending past ``retrieve_timeout``.
-
-        A retrieve whose result never arrives would otherwise leave the
-        request parked in WAITING_FOR_REMOTE_KVS forever: the scheduler only
-        promotes out of that state when the id comes back in
-        finished_recving. Mirror the unhealthy-drain path for exactly that
-        request: report it finished here and mark its blocks so vLLM
-        recomputes them. ``0`` disables the timeout.
-        """
-        if self._retrieve_timeout <= 0:
-            return
+    def _poll_retrieves(self) -> set[str]:
+        """Retire only transfers whose future confirms device completion."""
+        finished = self._dropped_retrieves
+        self._dropped_retrieves = set()
+        if not self.retrieve_futures:
+            return finished
         now = time.monotonic()
-        for request_id, (r_future, r_block_ids, submitted_at) in list(
-            self.retrieve_futures.items()
-        ):
-            if r_future.query():
-                continue
-            age_s = now - submitted_at
-            if age_s < self._retrieve_timeout:
-                continue
-            self.retrieve_futures.pop(request_id, None)
+        completed = []
+        for request_id, (future, blocks, submitted_at) in self.retrieve_futures.items():
+            try:
+                ready = future.query()
+                if ready:
+                    success = future.result(timeout=0)
+            except (OSError, zmq.ZMQError):
+                # Losing transport confirmation does not fence a device write.
+                self._health_event.clear()
+                ready = False
+            if ready:
+                if not success:
+                    self.error_block_ids.update(blocks)
+                    logger.error("Retrieve failed for request_id=%s", request_id)
+                completed.append(request_id)
+            elif (
+                self._retrieve_timeout > 0
+                and now - submitted_at >= self._retrieve_timeout
+                and request_id not in self._overdue_retrieves
+            ):
+                self._overdue_retrieves.add(request_id)
+                self._newly_unavailable.add(request_id)
+                logger.warning(
+                    "Retrieve for request_id=%s exceeded %.1fs; retaining its blocks "
+                    "until transfer completion",
+                    request_id,
+                    self._retrieve_timeout,
+                )
+
+        for request_id in completed:
+            del self.retrieve_futures[request_id]
             self.retrieve_events.pop(request_id, None)
-            self.error_block_ids.update(r_block_ids)
-            finished_retrieves.add(request_id)
-            logger.warning(
-                "Retrieve for request_id=%s timed out after %.1fs "
-                "(limit %.1fs); marking %d blocks as failed so vLLM "
-                "recomputes them",
-                request_id,
-                age_s,
-                self._retrieve_timeout,
-                len(r_block_ids),
-            )
+            self._overdue_retrieves.discard(request_id)
+            self._newly_unavailable.discard(request_id)
+        finished.update(completed)
+        return finished
+
+    def take_recovery_update(self) -> tuple[bool | None, set[str]]:
+        """Drain changes to lookup admission separately from receive completion."""
+        available = self.is_healthy and not self._overdue_retrieves
+        changed = available != self._advertised_available
+        self._advertised_available = available
+        newly_unavailable, self._newly_unavailable = self._newly_unavailable, set()
+        return available if changed else None, newly_unavailable
 
     @_lmcache_nvtx_annotate
     def get_finished(
@@ -1862,33 +1896,14 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
-        # If unhealthy, drain all pending futures immediately
+        finished_retrieves = self._poll_retrieves()
         if not self.is_healthy:
-            finished_stores = set(self.store_futures.keys())
-            finished_retrieves = set()
-            for request_id, (
-                _r_future,
-                r_block_ids,
-                _submitted_at,
-            ) in self.retrieve_futures.items():
-                finished_retrieves.add(request_id)
-                self.error_block_ids.update(r_block_ids)
+            finished_stores = set(self.store_futures)
             self.store_futures.clear()
-            self.retrieve_futures.clear()
             self.store_events.clear()
-            self.retrieve_events.clear()
-
-            # Retrieves dropped at submit time still must be reported,
-            # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
-            # Swap-drain (not update-then-clear): a concurrent
-            # submit_retrieve_request add lands in the old set (reported now)
-            # or the fresh set (reported next call), never lost.
-            dropped = self._dropped_retrieves
-            self._dropped_retrieves = set()
-            finished_retrieves.update(dropped)
 
             ret_stores = self._process_finished_stores(
-                finished_stores, finished_req_ids_from_engine
+                finished_stores, finished_req_ids_from_engine, finished_retrieves
             )
             # A request may have a pending retrieve AND appear in
             # finished_req_ids_from_engine (it ran without loading KV after
@@ -1899,8 +1914,6 @@ class LMCacheMPWorkerAdapter:
             return ret_stores, finished_retrieves
 
         finished_stores = set()
-        finished_retrieves = set()
-        self._expire_timed_out_retrieves(finished_retrieves)
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
                 continue
@@ -1915,45 +1928,13 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        for request_id, (r_future, r_block_ids, _submitted_at) in list(
-            self.retrieve_futures.items()
-        ):
-            if not r_future.query():
-                continue
-
-            r_result = r_future.result(timeout=60)
-            finished_retrieves.add(request_id)
-
-            if not r_result:
-                self.error_block_ids.update(r_block_ids)
-                logger.error(
-                    "Something went wrong when processing the "
-                    "retrieve request for request_id=%s, result=%s",
-                    request_id,
-                    r_result,
-                )
-
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
-        for request_id in finished_retrieves:
-            self.retrieve_futures.pop(request_id, None)
-            self.retrieve_events.pop(request_id, None)
-
-        # Retrieves dropped while unhealthy still must be reported,
-        # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
-        # finished_sending dedup is needed (unlike the unhealthy branch): a
-        # dropped retrieve's request is parked in WAITING_FOR_REMOTE_KVS until
-        # this report, so it cannot also be engine-finished in the same call.
-        # Swap-drain so a concurrent submit_retrieve_request add is never lost.
-        dropped = self._dropped_retrieves
-        self._dropped_retrieves = set()
-        finished_retrieves.update(dropped)
-
         # Update the internal states
         ret_stores = self._process_finished_stores(
-            finished_stores, finished_req_ids_from_engine
+            finished_stores, finished_req_ids_from_engine, finished_retrieves
         )
 
         # the invocation of `get_finished` means that
@@ -1994,37 +1975,17 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
-        # If unhealthy, drain all pending futures immediately
+        finished_retrieves = self._poll_retrieves()
         if not self.is_healthy:
-            finished_stores = set(self.store_futures.keys())
-            finished_retrieves = set()
-            for request_id, (
-                _r_future,
-                r_block_ids,
-                _submitted_at,
-            ) in self.retrieve_futures.items():
-                finished_retrieves.add(request_id)
-                self.error_block_ids.update(r_block_ids)
+            finished_stores = set(self.store_futures)
             self.store_futures.clear()
-            self.retrieve_futures.clear()
             self.store_events.clear()
-            self.retrieve_events.clear()
-
-            # Retrieves dropped at submit time still must be reported,
-            # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
-            # Swap-drain (not update-then-clear): a concurrent
-            # submit_retrieve_request add lands in the old set (reported now)
-            # or the fresh set (reported next call), never lost.
-            dropped = self._dropped_retrieves
-            self._dropped_retrieves = set()
-            finished_retrieves.update(dropped)
 
             for req_id in finished_stores:
                 self._completed_store_requests[req_id] = 1
             return None, finished_retrieves
 
         finished_stores = set()
-        finished_retrieves = set()
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
                 continue
@@ -2039,43 +2000,10 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        self._expire_timed_out_retrieves(finished_retrieves)
-        for request_id, (r_future, r_block_ids, _submitted_at) in list(
-            self.retrieve_futures.items()
-        ):
-            if not r_future.query():
-                continue
-
-            r_result = r_future.result(timeout=60)
-            finished_retrieves.add(request_id)
-
-            if not r_result:
-                self.error_block_ids.update(r_block_ids)
-                logger.error(
-                    "Something went wrong when processing the "
-                    "retrieve request for request_id=%s, result=%s",
-                    request_id,
-                    r_result,
-                )
-
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
-        for request_id in finished_retrieves:
-            self.retrieve_futures.pop(request_id, None)
-            self.retrieve_events.pop(request_id, None)
-
-        # Retrieves dropped while unhealthy still must be reported,
-        # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
-        # finished_sending dedup is needed (unlike the unhealthy branch): a
-        # dropped retrieve's request is parked in WAITING_FOR_REMOTE_KVS until
-        # this report, so it cannot also be engine-finished in the same call.
-        # Swap-drain so a concurrent submit_retrieve_request add is never lost.
-        dropped = self._dropped_retrieves
-        self._dropped_retrieves = set()
-        finished_retrieves.update(dropped)
-
         # the invocation of `get_finished` means that
         # these requests' KV caches are already fully stored.
         # or the requests normally ends without any store.
@@ -2108,7 +2036,7 @@ class LMCacheMPWorkerAdapter:
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
-        Returns the block IDs that failed due to retrieve timeout,
+        Return the block IDs of failed or never-submitted retrieves,
         then clears the internal set.
         """
         errors = self.error_block_ids.copy()

@@ -397,6 +397,12 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
     """
 
     completed_store_requests: dict[str, int]
+    unavailable_retrieves: set[str] = field(default_factory=set)
+    worker_cache_available: dict[int, bool] = field(default_factory=dict)
+
+    def get_unavailable_recv_requests(self) -> set[str]:
+        """Report request unavailability without releasing destination blocks."""
+        return self.unavailable_retrieves
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -405,4 +411,10 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
         merged = dict(self.completed_store_requests)
         for k, v in other.completed_store_requests.items():
             merged[k] = merged.get(k, 0) + v
-        return LMCacheMPWorkerMetadata(completed_store_requests=merged)
+        return LMCacheMPWorkerMetadata(
+            completed_store_requests=merged,
+            unavailable_retrieves=self.unavailable_retrieves
+            | other.unavailable_retrieves,
+            worker_cache_available=self.worker_cache_available
+            | other.worker_cache_available,
+        )
