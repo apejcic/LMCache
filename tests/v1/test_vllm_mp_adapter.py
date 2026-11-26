@@ -1116,6 +1116,45 @@ def test_late_retrieve_remains_owned_until_device_completion(
     assert not poll()
 
 
+@pytest.mark.parametrize("lazy", [False, True])
+def test_retrieve_deadline_remains_active_after_heartbeat_loss(
+    fake_adapter, monkeypatch, lazy
+):
+    adapter, _, _ = fake_adapter
+    adapter.lazy_offload = lazy
+    adapter._retrieve_timeout = 10
+    now = MagicMock()
+    monkeypatch.setattr(adapter_mod, "time", now)
+    future = MagicMock()
+    future.query.return_value = False
+    future.result.return_value = True
+    adapter.retrieve_futures["read"] = (future, [7], 1000)
+    adapter._health_event.clear()
+
+    def poll():
+        if lazy:
+            return adapter.get_finished_with_lazy_offload()[1]
+        return adapter.get_finished(set())[1]
+
+    now.monotonic.return_value = 1001
+    assert not poll()
+    assert adapter.take_recovery_update() == (False, set())
+    now.monotonic.return_value = 1010
+    assert not poll()
+    assert adapter.take_recovery_update() == (None, {"read"})
+    assert not poll()
+    assert adapter.take_recovery_update() == (None, set())
+    assert not adapter.get_block_ids_with_load_errors()
+
+    future.query.return_value = True
+    assert poll() == {"read"}
+    assert not poll()
+    assert adapter.take_recovery_update() == (None, set())
+    assert adapter._reregister_kv_caches_callback()
+    adapter._health_event.set()
+    assert adapter.take_recovery_update() == (True, set())
+
+
 def test_late_negative_result_reports_failed_blocks_only_at_completion(fake_adapter):
     adapter, _, _ = fake_adapter
     future = MagicMock()
