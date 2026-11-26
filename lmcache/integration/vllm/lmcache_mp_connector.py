@@ -913,15 +913,23 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         return val
 
     def build_connector_worker_meta(self):
-        if not self.lazy_offload:
+        completed = (
+            self.worker_adapter.get_completed_store_requests()
+            if self.lazy_offload
+            else None
+        )
+        available, overdue = self.worker_adapter.take_recovery_update()
+        if not completed and not overdue and available is None:
             return None
-        completed_store_requests = self.worker_adapter.get_completed_store_requests()
-        if completed_store_requests:
-            return LMCacheMPWorkerMetadata(
-                completed_store_requests=completed_store_requests
-            )
-        else:
-            return None
+        return LMCacheMPWorkerMetadata(
+            completed_store_requests=completed or {},
+            unavailable_retrieves=overdue,
+            worker_cache_available=(
+                {self.worker_adapter.parallel_strategy.vllm_worker_id: available}
+                if available is not None
+                else {}
+            ),
+        )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -1231,13 +1239,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        meta = connector_output.kv_connector_worker_meta
+        if not isinstance(meta, LMCacheMPWorkerMetadata):
+            return
+        if meta.worker_cache_available:
+            self.scheduler_adapter.update_worker_availability(
+                meta.worker_cache_available
+            )
         if not self.lazy_offload:
             return
         if not self._gpu_block_pool:
             raise ValueError("Lazy offload is enabled but gpu block pool is not binded")
-        meta = connector_output.kv_connector_worker_meta
-        if not isinstance(meta, LMCacheMPWorkerMetadata):
-            return
         for req_id, count in meta.completed_store_requests.items():
             if self.scheduler_adapter.update_pending_store_count(req_id, count):
                 gpu_block_ids = self._pending_store.get_request_gpu_block_ids(req_id)

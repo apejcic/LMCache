@@ -1070,42 +1070,146 @@ def test_recovery_reports_the_ring_re_registration_result(fake_adapter, ring_ok)
 
 
 @pytest.mark.parametrize("lazy_offload", [False, True])
-def test_timed_out_retrieve_is_reported_and_recomputed(
-    fake_adapter,
-    lazy_offload: bool,
-) -> None:
-    """A retrieve future that never resolves must not hang the request in
-    WAITING_FOR_REMOTE_KVS forever: past ``retrieve_timeout`` it is reported
-    finished exactly once and its blocks are marked for recompute."""
-    adapter, _send_mock, _future = fake_adapter
+@pytest.mark.parametrize("lose_heartbeat", [False, True])
+def test_late_retrieve_remains_owned_until_device_completion(
+    fake_adapter, lazy_offload, lose_heartbeat
+):
+    adapter, _, _ = fake_adapter
     adapter.lazy_offload = lazy_offload
-    adapter._retrieve_timeout = 30.0
-    stuck_future = MagicMock(name="stuck_future")
-    stuck_future.query.return_value = False
-    # Submitted 31s ago: past the 30s timeout.
-    adapter.retrieve_futures["req-stuck"] = (
-        stuck_future,
-        [7, 8],
-        time.monotonic() - 31.0,
+    adapter._retrieve_timeout = 30
+    future = MagicMock()
+    future.query.return_value = False
+    future.result.return_value = True
+    event = MagicMock()
+    adapter.retrieve_futures["late"] = (future, [7, 8], time.monotonic() - 31)
+    adapter.retrieve_events["late"] = event
+    other = MagicMock()
+    other.query.return_value = other.result.return_value = True
+    adapter.retrieve_futures["ready"] = (other, [9], time.monotonic())
+
+    def poll():
+        if lazy_offload:
+            return adapter.get_finished_with_lazy_offload()[1]
+        return adapter.get_finished(set())[1]
+
+    assert poll() == {"ready"}
+    assert adapter.get_block_ids_with_load_errors() == set()
+    assert adapter.take_recovery_update() == (False, {"late"})
+    if lose_heartbeat:
+        adapter._health_event.clear()
+        assert not adapter._reregister_kv_caches_callback()
+    assert not poll()
+    assert adapter.take_recovery_update() == (None, set())
+    assert adapter.retrieve_futures["late"][0] is future
+    assert adapter.retrieve_events["late"] is event
+
+    future.query.return_value = True
+    assert poll() == {"late"}
+    assert adapter.get_block_ids_with_load_errors() == set()
+    if lose_heartbeat:
+        assert adapter.take_recovery_update() == (None, set())
+        assert adapter._reregister_kv_caches_callback()
+        adapter._health_event.set()
+    assert adapter.take_recovery_update() == (True, set())
+    assert "late" not in adapter.retrieve_events
+    assert "late" not in adapter.retrieve_futures
+    assert not poll()
+
+
+def test_late_negative_result_reports_failed_blocks_only_at_completion(fake_adapter):
+    adapter, _, _ = fake_adapter
+    future = MagicMock()
+    future.query.return_value = future.result.return_value = False
+    adapter.retrieve_futures["late"] = (future, [7], time.monotonic() - 300)
+    assert not adapter.get_finished(set())[1]
+    assert not adapter.get_block_ids_with_load_errors()
+    assert adapter.take_recovery_update() == (False, {"late"})
+    future.query.return_value = True
+    assert adapter.get_finished(set())[1] == {"late"}
+    assert adapter.get_block_ids_with_load_errors() == {7}
+    assert not adapter.get_block_ids_with_load_errors()
+
+
+def test_finished_engine_request_does_not_release_a_pending_receive(fake_adapter):
+    adapter, _, _ = fake_adapter
+    future = MagicMock()
+    future.query.return_value = False
+    future.result.return_value = True
+    adapter.retrieve_futures["read"] = (future, [7], time.monotonic())
+    assert adapter.get_finished({"read"}) == (set(), set())
+    future.query.return_value = True
+    assert adapter.get_finished({"read"}) == (set(), {"read"})
+    assert adapter.get_finished({"read"}) == (set(), set())
+
+
+def test_transfer_confirmation_loss_keeps_destination_owned(fake_adapter):
+    adapter, _, _ = fake_adapter
+    future = MagicMock()
+    future.query.side_effect = TimeoutError
+    adapter.retrieve_futures["read"] = (future, [7], time.monotonic() - 300)
+    assert adapter.get_finished(set()) == (set(), set())
+    assert adapter.take_recovery_update() == (False, {"read"})
+    assert not adapter.get_block_ids_with_load_errors()
+    future.query.side_effect = None
+    future.query.return_value = future.result.return_value = True
+    assert adapter.get_finished(set())[1] == {"read"}
+
+
+def test_worker_availability_is_independent_per_rank(fake_adapter):
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_metadata import LMCacheMPWorkerMetadata
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        LMCacheMPSchedulerAdapter,
     )
-    adapter.retrieve_events["req-stuck"] = MagicMock()
 
+    left = LMCacheMPWorkerMetadata({"store": 1}, {"a"}, {0: False})
+    right = LMCacheMPWorkerMetadata({"store": 1}, {"b"}, {1: False})
+    both = left.aggregate(right)
+    assert both.get_unavailable_recv_requests() == {"a", "b"}
+    assert both.completed_store_requests == {"store": 2}
+    worker, client, _ = fake_adapter
+    scheduler = LMCacheMPSchedulerAdapter(
+        ["tcp://127.0.0.1:0"], MagicMock(), "test", 16, worker.parallel_strategy
+    )
+    scheduler.update_worker_availability(both.worker_cache_available)
+    scheduler.update_worker_availability({0: True})
+    tokens = list(range(scheduler.lmcache_tokens_per_chunk))
+    scheduler.maybe_submit_lookup_request("new", tokens)
+    assert scheduler.check_lookup_result("new") == 0
+    client.lookup.assert_not_called()
+    scheduler.update_worker_availability({1: True})
+    scheduler.maybe_submit_lookup_request("new", tokens)
+    client.lookup.assert_called_once()
+
+
+@pytest.mark.parametrize("lazy_offload", [False, True])
+def test_connector_forwards_overdue_read_metadata(fake_adapter, lazy_offload):
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+
+    adapter, _, _ = fake_adapter
+    adapter.lazy_offload = lazy_offload
+    worker = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    worker.lazy_offload = lazy_offload
+    worker.worker_adapter = adapter
+    future = MagicMock()
+    future.query.return_value = False
+    adapter.retrieve_futures["late"] = (future, [7], time.monotonic() - 300)
     if lazy_offload:
-        _stores, finished_retrieves = adapter.get_finished_with_lazy_offload()
+        adapter.get_finished_with_lazy_offload()
     else:
-        _stores, finished_retrieves = adapter.get_finished(set())
-
-    assert finished_retrieves == {"req-stuck"}
-    assert adapter.get_block_ids_with_load_errors() == {7, 8}
-    assert "req-stuck" not in adapter.retrieve_futures
-    assert "req-stuck" not in adapter.retrieve_events
-
-    # Reported exactly once: the next pass returns nothing for it.
-    if lazy_offload:
-        _s2, second = adapter.get_finished_with_lazy_offload()
-    else:
-        _s2, second = adapter.get_finished(set())
-    assert not second
+        adapter.get_finished(set())
+    meta = worker.build_connector_worker_meta()
+    assert meta.get_unavailable_recv_requests() == {"late"}
+    assert worker.build_connector_worker_meta() is None
+    scheduler = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    scheduler.lazy_offload = lazy_offload
+    scheduler._gpu_block_pool = MagicMock()
+    scheduler.scheduler_adapter = MagicMock()
+    scheduler.update_connector_output(MagicMock(kv_connector_worker_meta=meta))
+    scheduler.scheduler_adapter.update_worker_availability.assert_called_once_with(
+        {0: False}
+    )
 
 
 @pytest.mark.parametrize("lazy_offload", [False, True])
